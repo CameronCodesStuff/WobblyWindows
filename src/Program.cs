@@ -1,20 +1,41 @@
-// WobblyWindows — Compiz-style wobbly window dragging for Windows 11
-// Works on real app windows (Chrome, Discord, Explorer, etc.)
+// WobblyWindows v2 — soft-body wobbly window dragging for Windows 11
 //
-// How it works:
-//   1. A low-level mouse hook watches for a left-click that lands on a
-//      window's caption / drag region (WM_NCHITTEST == HTCAPTION).
-//   2. The native drag is swallowed and WobblyWindows takes over the move,
-//      driving the window with an under-damped spring so it lags, overshoots
-//      and jiggles like jelly. Optional squash & stretch deforms the window
-//      size based on velocity.
-//   3. On release the window keeps oscillating until it settles, then the
-//      exact target position/size is restored. Basic Aero-snap (top =
-//      maximize, left/right edge = half snap) is emulated.
+// Physics model (the important bit):
+//   The window is simulated as FOUR corner masses joined by structural
+//   springs (4 edges + 2 diagonals) — a tiny soft-body lattice, like a
+//   simplified Compiz mesh.
+//
+//   * The corner(s) nearest your grab point get a STIFF "lead" spring toward
+//     the cursor target → the grabbed section leads the motion immediately.
+//   * The far corners get a SOFT "trail" spring → the rest of the window
+//     lags behind, stretching toward the lead.
+//   * Structural springs transmit motion between corners at finite speed →
+//     direction changes make different areas catch up at different rates,
+//     producing ripples across the surface.
+//   * Low damping ratio → on release the shape overshoots its resting
+//     position, then rebounds with progressively smaller oscillations
+//     before settling exactly on target.
+//
+//   Each frame the real window rect is fitted to the deformed quad
+//   (edge-midpoint averaging), so the actual app window stretches,
+//   compresses and wobbles. Win32 can't shear other apps' windows, but this
+//   is the closest physical approximation — and it feels like soft rubber.
+//
+// This is a TRAY-ONLY app: no window opens. Look for the icon in the system
+// tray (bottom-right, near the clock — check the ^ hidden-icons flyout).
+//
+// Two ways to wobble:
+//   1. Drag any title bar / drag region (Chrome tab strip, Discord top bar).
+//   2. Hold Ctrl+Alt and drag ANYWHERE on a window — guaranteed fallback.
+//
+// Diagnostics: %LOCALAPPDATA%\WobblyWindows\wobbly.log (tray → Open log)
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace WobblyWindows;
 
@@ -27,8 +48,10 @@ static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        Log.Write("=== WobblyWindows v2 starting ===");
         using var tray = new TrayApp();
         Application.Run();
+        Log.Write("=== exiting ===");
     }
 }
 
@@ -37,21 +60,98 @@ static class Program
 // ─────────────────────────────────────────────────────────────────────────────
 static class Config
 {
-    // Spring stiffness (higher = snappier, lower = floatier)
-    public const double Stiffness = 620.0;
-    // Damping ratio (1.0 = no wobble, 0.2 = very jiggly)
-    public const double DampingRatio = 0.30;
-    // Squash & stretch amount per px/s of velocity
-    public const double SquashPerVelocity = 0.00028;
-    // Max squash/stretch (0.15 = up to 15% deformation)
-    public const double SquashMax = 0.14;
-    // Physics tick target (ms)
+    // Stiffness of the spring pulling the GRABBED corner to the cursor.
+    // High = the grabbed section leads almost immediately (slight delay).
+    public const double LeadStiffness = 1500.0;
+
+    // Stiffness pulling the FARTHEST corners along. Low = they trail behind,
+    // stretching toward the lead. The gap between these two numbers is what
+    // creates the "soft rubber" feel.
+    public const double TrailStiffness = 300.0;
+
+    // Springs between corners (edges + diagonals). Higher = ripples travel
+    // faster across the surface and the shape recovers its rectangle sooner.
+    public const double StructuralStiffness = 950.0;
+
+    // Damping ratio. 1.0 = no wobble at all; ~0.25 = overshoot + a few
+    // progressively smaller rebounds before settling (the Compiz feel).
+    public const double DampingRatio = 0.25;
+
+    // Extra global velocity damping (per second) — kills residual jitter.
+    public const double GlobalDamping = 1.2;
+
+    // Max stretch/compression of the real window, as a fraction of its base
+    // size (0.28 = up to 28%). The physics is unclamped; only the rect is.
+    public const double StretchMax = 0.28;
+
+    // Integration: physics ticks every TickMs, subdivided into substeps of at
+    // most MaxSubstep seconds for stability at high stiffness.
     public const int TickMs = 4;
-    // Snap threshold in px from monitor edge
+    public const double MaxSubstep = 0.004;
+
+    // Don't resize the real window for changes smaller than this (px) —
+    // avoids hammering apps with 1px relayouts.
+    public const int MinResizeDelta = 2;
+
+    // Edge snap threshold on release (px from monitor edge)
     public const int SnapThreshold = 6;
-    // Settle thresholds
-    public const double SettleVelocity = 25.0;   // px/s
+
+    // Settle thresholds: every corner within this distance of its rest spot
+    // and slower than this velocity → land exactly and stop.
+    public const double SettleVelocity = 22.0;   // px/s
     public const double SettleDistance = 0.8;    // px
+
+    // Hit-test reply timeout (ms) — keep small, it runs inside the mouse hook
+    public const uint HitTestTimeoutMs = 60;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async file logger (never blocks the mouse hook)
+// ─────────────────────────────────────────────────────────────────────────────
+static class Log
+{
+    public static readonly string FilePath;
+    static readonly ConcurrentQueue<string> _queue = new();
+    static readonly AutoResetEvent _signal = new(false);
+
+    static Log()
+    {
+        string dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "WobblyWindows");
+        try { Directory.CreateDirectory(dir); } catch { }
+        FilePath = Path.Combine(dir, "wobbly.log");
+        try
+        {
+            if (File.Exists(FilePath) && new FileInfo(FilePath).Length > 512 * 1024)
+                File.Delete(FilePath); // keep the log small
+        }
+        catch { }
+
+        var t = new Thread(Drain) { IsBackground = true, Name = "LogWriter" };
+        t.Start();
+    }
+
+    public static void Write(string message)
+    {
+        _queue.Enqueue($"{DateTime.Now:HH:mm:ss.fff} {message}");
+        _signal.Set();
+    }
+
+    static void Drain()
+    {
+        var sb = new StringBuilder();
+        while (true)
+        {
+            _signal.WaitOne(2000);
+            sb.Clear();
+            while (_queue.TryDequeue(out var line)) sb.AppendLine(line);
+            if (sb.Length > 0)
+            {
+                try { File.AppendAllText(FilePath, sb.ToString()); } catch { }
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,35 +171,72 @@ sealed class TrayApp : IDisposable
         var menu = new ContextMenuStrip();
 
         var enabled = new ToolStripMenuItem("Enabled") { Checked = true, CheckOnClick = true };
-        enabled.CheckedChanged += (_, _) => _hook.Enabled = enabled.Checked;
+        enabled.CheckedChanged += (_, _) =>
+        {
+            _hook.Enabled = enabled.Checked;
+            if (enabled.Checked) _hook.Reinstall(); // also recovers a dropped hook
+        };
 
-        var squash = new ToolStripMenuItem("Squash && stretch") { Checked = _engine.SquashEnabled, CheckOnClick = true };
-        squash.CheckedChanged += (_, _) => _engine.SquashEnabled = squash.Checked;
+        var stretch = new ToolStripMenuItem("Elastic stretch") { Checked = _engine.StretchEnabled, CheckOnClick = true };
+        stretch.CheckedChanged += (_, _) => _engine.StretchEnabled = stretch.Checked;
 
         var snap = new ToolStripMenuItem("Edge snap on release") { Checked = _engine.SnapEnabled, CheckOnClick = true };
         snap.CheckedChanged += (_, _) => _engine.SnapEnabled = snap.Checked;
+
+        var openLog = new ToolStripMenuItem("Open log file");
+        openLog.Click += (_, _) =>
+        {
+            try { Process.Start(new ProcessStartInfo(Log.FilePath) { UseShellExecute = true }); }
+            catch { }
+        };
 
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => { Dispose(); Application.Exit(); };
 
         menu.Items.Add(enabled);
-        menu.Items.Add(squash);
+        menu.Items.Add(stretch);
         menu.Items.Add(snap);
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(openLog);
         menu.Items.Add(exit);
 
         _icon = new NotifyIcon
         {
-            Icon = MakeIcon(),
-            Text = "WobblyWindows — drag any title bar",
+            Icon = LoadAppIcon(),
+            Text = "WobblyWindows — drag a title bar, or Ctrl+Alt+drag anywhere",
             Visible = true,
             ContextMenuStrip = menu,
         };
 
         _hook.Install();
+
+        // Make it obvious the app is alive and where it lives
+        _icon.BalloonTipTitle = "WobblyWindows is running";
+        _icon.BalloonTipText =
+            "No window opens — I live in the system tray (bottom-right, near the clock; " +
+            "check the ^ hidden-icons flyout). Drag any title bar to wobble, " +
+            "or hold Ctrl+Alt and drag anywhere on a window.";
+        _icon.BalloonTipIcon = ToolTipIcon.Info;
+        _icon.ShowBalloonTip(6000);
     }
 
-    static Icon MakeIcon()
+    // Prefer the project logo (assets/app.ico) shipped next to the exe;
+    // fall back to a generated jelly icon.
+    static Icon LoadAppIcon()
+    {
+        foreach (var candidate in new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "assets", "app.ico"),
+            Path.Combine(AppContext.BaseDirectory, "app.ico"),
+        })
+        {
+            try { if (File.Exists(candidate)) return new Icon(candidate); }
+            catch { }
+        }
+        return MakeFallbackIcon();
+    }
+
+    static Icon MakeFallbackIcon()
     {
         using var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp))
@@ -108,7 +245,6 @@ sealed class TrayApp : IDisposable
             g.Clear(Color.Transparent);
             using var body = new SolidBrush(Color.FromArgb(255, 0, 229, 255));
             using var bar = new SolidBrush(Color.FromArgb(255, 10, 10, 26));
-            // wobbly window blob
             g.FillClosedCurve(body, new[]
             {
                 new Point(4, 8), new Point(28, 5), new Point(27, 26), new Point(5, 28)
@@ -152,6 +288,7 @@ sealed class MouseHook : IDisposable
         "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW",
         "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow",
         "NotifyIconOverflowWindow", "TaskListThumbnailWnd",
+        "TopLevelWindowForOverflowXamlIsland", "Xaml_WindowedPopupClass",
     };
 
     public MouseHook(WobbleEngine engine)
@@ -162,38 +299,66 @@ sealed class MouseHook : IDisposable
 
     public void Install()
     {
-        _hookHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _proc,
-            Native.GetModuleHandle(null), 0);
+        // user32's module handle is the most reliable hMod for LL hooks,
+        // especially under single-file publish where the exe module can be odd.
+        IntPtr user32 = Native.LoadLibrary("user32.dll");
+        _hookHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _proc, user32, 0);
         if (_hookHandle == IntPtr.Zero)
-            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        {
+            int err = Marshal.GetLastWin32Error();
+            Log.Write($"HOOK INSTALL FAILED, Win32 error {err}");
+            MessageBox.Show(
+                $"Failed to install the mouse hook (Win32 error {err}).\n" +
+                "Some antivirus/anti-cheat software blocks low-level hooks.",
+                "WobblyWindows", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        Log.Write("Mouse hook installed OK");
+    }
+
+    public void Reinstall()
+    {
+        if (_hookHandle != IntPtr.Zero)
+        {
+            Native.UnhookWindowsHookEx(_hookHandle);
+            _hookHandle = IntPtr.Zero;
+        }
+        Install();
     }
 
     IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0 && Enabled)
         {
-            var info = Marshal.PtrToStructure<Native.MSLLHOOKSTRUCT>(lParam);
-            int msg = (int)wParam;
-
-            switch (msg)
+            try
             {
-                case Native.WM_LBUTTONDOWN:
-                    if (OnButtonDown(info.pt))
-                        return (IntPtr)1; // swallow — we own this drag now
-                    break;
+                var info = Marshal.PtrToStructure<Native.MSLLHOOKSTRUCT>(lParam);
+                int msg = (int)wParam;
 
-                case Native.WM_MOUSEMOVE:
-                    if (_engine.Dragging)
-                        _engine.UpdateCursor(info.pt);
-                    break;
+                switch (msg)
+                {
+                    case Native.WM_LBUTTONDOWN:
+                        if (OnButtonDown(info.pt))
+                            return (IntPtr)1; // swallow — we own this drag now
+                        break;
 
-                case Native.WM_LBUTTONUP:
-                    if (_engine.Dragging)
-                    {
-                        _engine.EndDrag(info.pt);
-                        return (IntPtr)1; // pair with the swallowed down
-                    }
-                    break;
+                    case Native.WM_MOUSEMOVE:
+                        if (_engine.Dragging)
+                            _engine.UpdateCursor(info.pt);
+                        break;
+
+                    case Native.WM_LBUTTONUP:
+                        if (_engine.Dragging)
+                        {
+                            _engine.EndDrag(info.pt);
+                            return (IntPtr)1; // pair with the swallowed down
+                        }
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Hook exception: " + ex);
             }
         }
         return Native.CallNextHookEx(_hookHandle, nCode, wParam, lParam);
@@ -206,7 +371,6 @@ sealed class MouseHook : IDisposable
 
         IntPtr root = Native.GetAncestor(hit, Native.GA_ROOT);
         if (root == IntPtr.Zero || !Native.IsWindowVisible(root)) return false;
-        if (Native.IsZoomed(root) || Native.IsIconic(root)) return false; // let native handle maximized
 
         Native.GetWindowThreadProcessId(root, out uint pid);
         if (pid == _ownPid) return false;
@@ -215,15 +379,53 @@ sealed class MouseHook : IDisposable
         foreach (var ex in ExcludedClasses)
             if (string.Equals(cls, ex, StringComparison.OrdinalIgnoreCase)) return false;
 
-        // Ask the window what's under the cursor — HTCAPTION covers native
-        // title bars *and* custom drag regions (Chrome tab strip, Discord's
-        // Electron drag area, etc.)
-        if (!Native.TryHitTest(root, pt, out int hitCode) || hitCode != Native.HTCAPTION)
+        if (Native.IsZoomed(root) || Native.IsIconic(root))
+        {
+            Log.Write($"click on '{cls}' skipped (maximized/minimized) — native drag");
             return false;
+        }
+
+        // Fallback trigger: Ctrl+Alt held → wobble-drag from anywhere on the
+        // window, no hit-testing needed. Guaranteed to work.
+        bool combo = Native.IsKeyDown(Native.VK_CONTROL) && Native.IsKeyDown(Native.VK_MENU);
+
+        int hitCode = -1;
+        if (!combo)
+        {
+            // Ask the window chain what's under the cursor. HTCAPTION covers
+            // native title bars *and* custom drag regions (Chrome tab strip,
+            // Discord's Electron drag area, etc.). Some apps only answer
+            // correctly on the child under the cursor, others only on the
+            // root — try the child first, then the root.
+            if (hit != root && Native.TryHitTest(hit, pt, out int childHit)
+                && childHit == Native.HTCAPTION)
+            {
+                hitCode = childHit;
+            }
+            else if (Native.TryHitTest(root, pt, out int rootHit))
+            {
+                hitCode = rootHit;
+            }
+            else
+            {
+                Log.Write($"click on '{cls}': hit-test FAILED (timeout/UIPI — elevated app?) — native drag. " +
+                          "Tip: Ctrl+Alt+drag still works, or run WobblyWindows as admin.");
+                return false;
+            }
+
+            if (hitCode != Native.HTCAPTION)
+            {
+                // Normal client-area click; stay out of the way. Logged so the
+                // log shows what the app answered when you clicked a title bar.
+                Log.Write($"click on '{cls}': hit={hitCode} (not caption) — passed through");
+                return false;
+            }
+        }
 
         // Double-click on caption → forward as maximize toggle instead of drag
         long now = Environment.TickCount64;
-        if (root == _lastDownWindow
+        if (!combo
+            && root == _lastDownWindow
             && now - _lastDownTick <= Native.GetDoubleClickTime()
             && Math.Abs(pt.X - _lastDownPoint.X) <= SystemInformation.DoubleClickSize.Width
             && Math.Abs(pt.Y - _lastDownPoint.Y) <= SystemInformation.DoubleClickSize.Height)
@@ -232,6 +434,7 @@ sealed class MouseHook : IDisposable
             _engine.Cancel();
             Native.PostMessage(root, Native.WM_NCLBUTTONDBLCLK,
                 (IntPtr)Native.HTCAPTION, Native.MakeLParam(pt.X, pt.Y));
+            Log.Write($"double-click on '{cls}' forwarded (maximize toggle)");
             return true;
         }
 
@@ -239,6 +442,7 @@ sealed class MouseHook : IDisposable
         _lastDownWindow = root;
         _lastDownPoint = pt;
 
+        Log.Write($"BEGIN drag on '{cls}' ({(combo ? "Ctrl+Alt combo" : $"hit={hitCode}")})");
         _engine.BeginDrag(root, pt);
         return true;
     }
@@ -254,28 +458,48 @@ sealed class MouseHook : IDisposable
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Physics: under-damped spring drives the window toward the cursor
+// Soft-body physics: 4 corner masses + structural springs
 // ─────────────────────────────────────────────────────────────────────────────
 sealed class WobbleEngine : IDisposable
 {
-    public volatile bool SquashEnabled = true;
+    public volatile bool StretchEnabled = true;
     public volatile bool SnapEnabled = true;
     public bool Dragging { get { lock (_gate) return _dragging; } }
+
+    const int TL = 0, TR = 1, BR = 2, BL = 3;
+
+    // structural lattice: 4 edges + 2 diagonals
+    static readonly (int a, int b)[] SpringPairs =
+    {
+        (TL, TR), (TR, BR), (BR, BL), (BL, TL),
+        (TL, BR), (TR, BL),
+    };
 
     readonly object _gate = new();
     readonly AutoResetEvent _wake = new(false);
     readonly Thread _thread;
     volatile bool _shutdown;
 
-    // state (guarded by _gate)
+    // ── state (guarded by _gate) ─────────────────────────────────────────────
     bool _dragging, _active;
     IntPtr _hwnd;
-    double _px, _py, _vx, _vy;      // simulated position / velocity (top-left)
-    double _tx, _ty;                // target position (cursor - grab offset)
+
+    readonly double[] _px = new double[4], _py = new double[4]; // corner positions
+    readonly double[] _vx = new double[4], _vy = new double[4]; // corner velocities
+    readonly double[] _k = new double[4];                       // per-corner follow stiffness
+    readonly double[] _c = new double[4];                       // per-corner damping
+    readonly double[] _restLen = new double[SpringPairsCount];  // spring rest lengths
+    readonly double[] _offX = new double[4], _offY = new double[4]; // rest offsets from top-left
+
+    const int SpringPairsCount = 6;
+
+    double _tx, _ty;                 // ideal (rest) top-left = cursor - grab offset
     int _grabDx, _grabDy;
     int _baseW, _baseH;
+    int _lastW, _lastH;              // last applied size (resize hysteresis)
     Point _releaseCursor;
     bool _pendingSnapCheck;
+    bool _loggedMoveFailure;
 
     public WobbleEngine()
     {
@@ -286,21 +510,65 @@ sealed class WobbleEngine : IDisposable
 
     public void BeginDrag(IntPtr hwnd, Point cursor)
     {
-        if (!Native.GetWindowRect(hwnd, out var rc)) return;
+        if (!Native.GetWindowRect(hwnd, out var rc))
+        {
+            Log.Write("BeginDrag: GetWindowRect failed");
+            return;
+        }
+
+        int w = rc.Right - rc.Left, h = rc.Bottom - rc.Top;
+        if (w < 1 || h < 1) return;
 
         lock (_gate)
         {
             _hwnd = hwnd;
-            _px = rc.Left; _py = rc.Top;
-            _vx = _vy = 0;
+            _baseW = w; _baseH = h;
+            _lastW = w; _lastH = h;
             _grabDx = cursor.X - rc.Left;
             _grabDy = cursor.Y - rc.Top;
-            _tx = _px; _ty = _py;
-            _baseW = rc.Right - rc.Left;
-            _baseH = rc.Bottom - rc.Top;
+            _tx = rc.Left; _ty = rc.Top;
+
+            // corner rest offsets from the window's top-left
+            _offX[TL] = 0; _offY[TL] = 0;
+            _offX[TR] = w; _offY[TR] = 0;
+            _offX[BR] = w; _offY[BR] = h;
+            _offX[BL] = 0; _offY[BL] = h;
+
+            for (int i = 0; i < 4; i++)
+            {
+                _px[i] = rc.Left + _offX[i];
+                _py[i] = rc.Top + _offY[i];
+                _vx[i] = 0; _vy[i] = 0;
+            }
+
+            // Per-corner "follow" stiffness: near the grab → LeadStiffness
+            // (leads immediately), far corners → TrailStiffness (trail behind
+            // and stretch). Distance measured in the unit square so window
+            // aspect ratio doesn't skew the feel.
+            double gu = Math.Clamp(_grabDx / (double)w, 0, 1);
+            double gv = Math.Clamp(_grabDy / (double)h, 0, 1);
+            ReadOnlySpan<double> cu = stackalloc double[] { 0, 1, 1, 0 };
+            ReadOnlySpan<double> cv = stackalloc double[] { 0, 0, 1, 1 };
+            for (int i = 0; i < 4; i++)
+            {
+                double d = Math.Sqrt((cu[i] - gu) * (cu[i] - gu) + (cv[i] - gv) * (cv[i] - gv));
+                double t = Math.Clamp(d / Math.Sqrt(2.0), 0, 1); // 0 at grab, 1 at farthest possible
+                _k[i] = Config.LeadStiffness + (Config.TrailStiffness - Config.LeadStiffness) * t;
+                _c[i] = 2.0 * Config.DampingRatio * Math.Sqrt(_k[i]);
+            }
+
+            // structural rest lengths from the base rectangle
+            for (int s = 0; s < SpringPairsCount; s++)
+            {
+                var (a, b) = SpringPairs[s];
+                double dx = _offX[b] - _offX[a], dy = _offY[b] - _offY[a];
+                _restLen[s] = Math.Sqrt(dx * dx + dy * dy);
+            }
+
             _dragging = true;
             _active = true;
             _pendingSnapCheck = false;
+            _loggedMoveFailure = false;
         }
 
         ForceForeground(hwnd);
@@ -357,87 +625,192 @@ sealed class WobbleEngine : IDisposable
             double dt = Math.Min(now - last, 0.025);
             last = now;
 
-            Step(dt);
+            Tick(dt);
             Thread.Sleep(Config.TickMs);
         }
     }
 
-    void Step(double dt)
+    void Tick(double dt)
     {
         IntPtr hwnd;
-        double px, py, vx, vy, tx, ty;
-        bool dragging, snapCheck;
-        int baseW, baseH;
+        bool snapCheck;
         Point releaseCursor;
 
         lock (_gate)
         {
             if (!_active) return;
             hwnd = _hwnd;
-            px = _px; py = _py; vx = _vx; vy = _vy; tx = _tx; ty = _ty;
-            dragging = _dragging;
-            baseW = _baseW; baseH = _baseH;
-            snapCheck = _pendingSnapCheck;
+            snapCheck = !_dragging && _pendingSnapCheck;
             releaseCursor = _releaseCursor;
+            if (snapCheck) _pendingSnapCheck = false;
         }
 
         if (!Native.IsWindow(hwnd)) { Cancel(); return; }
 
         // Snap check fires once, right after release
-        if (!dragging && snapCheck)
+        if (snapCheck && TryEdgeSnap(hwnd, releaseCursor)) { Cancel(); return; }
+
+        bool settled;
+        int x, y, w, h;
+        uint sizeFlag;
+        int finalX, finalY, baseW, baseH;
+
+        lock (_gate)
         {
-            lock (_gate) _pendingSnapCheck = false;
-            if (TryEdgeSnap(hwnd, releaseCursor)) { Cancel(); return; }
+            if (!_active) return;
+
+            Integrate(dt);
+            settled = IsSettled();
+            ComputeOutputRect(out x, out y, out w, out h, out sizeFlag);
+
+            finalX = (int)Math.Round(_tx);
+            finalY = (int)Math.Round(_ty);
+            baseW = _baseW; baseH = _baseH;
         }
-
-        // Semi-implicit Euler spring integration
-        double w = Math.Sqrt(Config.Stiffness);
-        double c = 2.0 * Config.DampingRatio * w;
-
-        double ax = Config.Stiffness * (tx - px) - c * vx;
-        double ay = Config.Stiffness * (ty - py) - c * vy;
-        vx += ax * dt; vy += ay * dt;
-        px += vx * dt; py += vy * dt;
-
-        // Squash & stretch based on velocity
-        int outW = baseW, outH = baseH;
-        double drawX = px, drawY = py;
-        uint sizeFlag = Native.SWP_NOSIZE;
-        if (SquashEnabled)
-        {
-            sizeFlag = 0;
-            double sx = Math.Min(Math.Abs(vx) * Config.SquashPerVelocity, Config.SquashMax);
-            double sy = Math.Min(Math.Abs(vy) * Config.SquashPerVelocity, Config.SquashMax);
-            outW = (int)Math.Round(baseW * (1.0 + sx - sy * 0.5));
-            outH = (int)Math.Round(baseH * (1.0 + sy - sx * 0.5));
-            drawX = px - (outW - baseW) / 2.0;
-            drawY = py - (outH - baseH) / 2.0;
-        }
-
-        bool settled = !dragging
-            && Math.Abs(vx) < Config.SettleVelocity && Math.Abs(vy) < Config.SettleVelocity
-            && Math.Abs(tx - px) < Config.SettleDistance && Math.Abs(ty - py) < Config.SettleDistance;
 
         if (settled)
         {
-            // land exactly on target with original size
-            Native.SetWindowPos(hwnd, IntPtr.Zero,
-                (int)Math.Round(tx), (int)Math.Round(ty), baseW, baseH,
+            // land exactly on target with original size — completely still
+            Native.SetWindowPos(hwnd, IntPtr.Zero, finalX, finalY, baseW, baseH,
                 Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
             Cancel();
             return;
         }
 
-        Native.SetWindowPos(hwnd, IntPtr.Zero,
-            (int)Math.Round(drawX), (int)Math.Round(drawY), outW, outH,
+        bool ok = Native.SetWindowPos(hwnd, IntPtr.Zero, x, y, w, h,
             Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER |
             Native.SWP_ASYNCWINDOWPOS | sizeFlag);
 
-        lock (_gate)
+        if (!ok && !_loggedMoveFailure)
         {
-            if (!_active) return;
-            _px = px; _py = py; _vx = vx; _vy = vy;
+            _loggedMoveFailure = true;
+            Log.Write($"SetWindowPos FAILED, Win32 error {Marshal.GetLastWin32Error()} " +
+                      "(elevated window? run WobblyWindows as admin)");
         }
+    }
+
+    // Semi-implicit Euler with substepping for stability at high stiffness.
+    // Called with _gate held.
+    void Integrate(double dt)
+    {
+        int steps = Math.Max(1, (int)Math.Ceiling(dt / Config.MaxSubstep));
+        double hStep = dt / steps;
+
+        Span<double> fx = stackalloc double[4];
+        Span<double> fy = stackalloc double[4];
+
+        for (int s = 0; s < steps; s++)
+        {
+            fx.Clear(); fy.Clear();
+
+            // follow springs: each corner is pulled toward its rest position
+            // in the ideal rect, with per-corner stiffness (lead vs trail)
+            for (int i = 0; i < 4; i++)
+            {
+                double ix = _tx + _offX[i];
+                double iy = _ty + _offY[i];
+                fx[i] += _k[i] * (ix - _px[i]) - _c[i] * _vx[i];
+                fy[i] += _k[i] * (iy - _py[i]) - _c[i] * _vy[i];
+            }
+
+            // structural springs: transmit motion corner-to-corner → ripples
+            for (int sp = 0; sp < SpringPairsCount; sp++)
+            {
+                var (a, b) = SpringPairs[sp];
+                double dx = _px[b] - _px[a];
+                double dy = _py[b] - _py[a];
+                double dist = Math.Sqrt(dx * dx + dy * dy);
+                if (dist < 1e-6) continue;
+                double f = Config.StructuralStiffness * (dist - _restLen[sp]) / dist;
+                fx[a] += f * dx; fy[a] += f * dy;
+                fx[b] -= f * dx; fy[b] -= f * dy;
+            }
+
+            double decay = Math.Max(0.0, 1.0 - Config.GlobalDamping * hStep);
+            for (int i = 0; i < 4; i++)
+            {
+                _vx[i] = (_vx[i] + fx[i] * hStep) * decay;
+                _vy[i] = (_vy[i] + fy[i] * hStep) * decay;
+                _px[i] += _vx[i] * hStep;
+                _py[i] += _vy[i] * hStep;
+            }
+        }
+
+        // safety: if physics ever blows up, teleport to rest
+        for (int i = 0; i < 4; i++)
+        {
+            if (Math.Abs(_px[i] - (_tx + _offX[i])) > 5000 ||
+                Math.Abs(_py[i] - (_ty + _offY[i])) > 5000)
+            {
+                for (int j = 0; j < 4; j++)
+                {
+                    _px[j] = _tx + _offX[j]; _py[j] = _ty + _offY[j];
+                    _vx[j] = 0; _vy[j] = 0;
+                }
+                break;
+            }
+        }
+    }
+
+    // Called with _gate held.
+    bool IsSettled()
+    {
+        if (_dragging) return false;
+        for (int i = 0; i < 4; i++)
+        {
+            if (Math.Abs(_px[i] - (_tx + _offX[i])) >= Config.SettleDistance) return false;
+            if (Math.Abs(_py[i] - (_ty + _offY[i])) >= Config.SettleDistance) return false;
+            if (Math.Abs(_vx[i]) >= Config.SettleVelocity) return false;
+            if (Math.Abs(_vy[i]) >= Config.SettleVelocity) return false;
+        }
+        return true;
+    }
+
+    // Fit the real (axis-aligned) window rect to the deformed corner quad.
+    // Edge positions are the average of their two corners, which captures
+    // stretch/compression while cancelling shear the OS can't display.
+    // Called with _gate held.
+    void ComputeOutputRect(out int x, out int y, out int w, out int h, out uint sizeFlag)
+    {
+        double left = (_px[TL] + _px[BL]) * 0.5;
+        double right = (_px[TR] + _px[BR]) * 0.5;
+        double top = (_py[TL] + _py[TR]) * 0.5;
+        double bottom = (_py[BL] + _py[BR]) * 0.5;
+
+        double cx = (left + right) * 0.5;
+        double cy = (top + bottom) * 0.5;
+
+        if (!StretchEnabled)
+        {
+            w = _baseW; h = _baseH;
+            x = (int)Math.Round(cx - _baseW * 0.5);
+            y = (int)Math.Round(cy - _baseH * 0.5);
+            sizeFlag = Native.SWP_NOSIZE;
+            return;
+        }
+
+        double minW = _baseW * (1.0 - Config.StretchMax), maxW = _baseW * (1.0 + Config.StretchMax);
+        double minH = _baseH * (1.0 - Config.StretchMax), maxH = _baseH * (1.0 + Config.StretchMax);
+        int wantW = (int)Math.Round(Math.Clamp(right - left, minW, maxW));
+        int wantH = (int)Math.Round(Math.Clamp(bottom - top, minH, maxH));
+
+        // resize hysteresis: skip sub-threshold size changes so apps aren't
+        // hammered with 1px relayouts every 4ms
+        if (Math.Abs(wantW - _lastW) < Config.MinResizeDelta &&
+            Math.Abs(wantH - _lastH) < Config.MinResizeDelta)
+        {
+            w = _lastW; h = _lastH;
+            sizeFlag = Native.SWP_NOSIZE;
+        }
+        else
+        {
+            w = wantW; h = wantH;
+            _lastW = w; _lastH = h;
+            sizeFlag = 0;
+        }
+
+        x = (int)Math.Round(cx - w * 0.5);
+        y = (int)Math.Round(cy - h * 0.5);
     }
 
     // Minimal Aero-snap emulation: top edge = maximize, left/right = half snap
@@ -507,6 +880,7 @@ static class Native
     public const uint GA_ROOT = 2;
     public const int SW_MAXIMIZE = 3;
     public const uint MONITOR_DEFAULTTONEAREST = 2;
+    public const int VK_CONTROL = 0x11;
     public const byte VK_MENU = 0x12;
     public const uint KEYEVENTF_KEYUP = 0x0002;
 
@@ -521,9 +895,6 @@ static class Native
     public static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
 
     public delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int X, Y; }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
@@ -555,8 +926,8 @@ static class Native
     [DllImport("user32.dll")]
     public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
-    public static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr LoadLibrary(string lpFileName);
 
     [DllImport("user32.dll")]
     public static extern IntPtr WindowFromPoint(Point p);
@@ -602,13 +973,16 @@ static class Native
     public static extern uint GetDoubleClickTime();
 
     [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromPoint(Point pt, uint flags);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO mi);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder sb, int max);
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
 
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
@@ -616,25 +990,24 @@ static class Native
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
 
+    public static bool IsKeyDown(int vKey) => (GetAsyncKeyState(vKey) & 0x8000) != 0;
+
     public static IntPtr MakeLParam(int x, int y) => (IntPtr)((y << 16) | (x & 0xFFFF));
 
     public static string GetClassNameSafe(IntPtr hwnd)
     {
-        var sb = new System.Text.StringBuilder(256);
+        var sb = new StringBuilder(256);
         GetClassName(hwnd, sb, sb.Capacity);
         return sb.ToString();
     }
 
-    public static bool TryHitTest(IntPtr hwnd, Point pt, uint timeoutMs, out int hitCode)
+    public static bool TryHitTest(IntPtr hwnd, Point pt, out int hitCode)
     {
         hitCode = 0;
         IntPtr ok = SendMessageTimeout(hwnd, WM_NCHITTEST, IntPtr.Zero,
-            MakeLParam(pt.X, pt.Y), SMTO_ABORTIFHUNG, timeoutMs, out IntPtr result);
+            MakeLParam(pt.X, pt.Y), SMTO_ABORTIFHUNG, Config.HitTestTimeoutMs, out IntPtr result);
         if (ok == IntPtr.Zero) return false;
         hitCode = (int)(long)result;
         return true;
     }
-
-    public static bool TryHitTest(IntPtr hwnd, Point pt, out int hitCode)
-        => TryHitTest(hwnd, pt, 30, out hitCode);
 }
