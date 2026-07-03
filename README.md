@@ -43,20 +43,29 @@ Windows can't bend another app's live window, and rapidly resizing a real window
 
 If capture or transparency isn't possible on a particular window (already-layered apps, elevated apps without admin), it automatically falls back to a rigid spring-follow drag, so dragging always works.
 
-## Tuning
+## Settings
 
-All constants live in `Config` at the top of `src/Program.cs`:
+Right-click the tray icon → **Settings…** for a live control panel (saved to `%LOCALAPPDATA%\WobblyWindows\settings.json`):
+
+- **Speed** — how fast the jelly reacts and settles
+- **Wobble amount** — how many rebounds after release (0 = none)
+- **Softness** — how rubbery the trailing stretch is
+- **Max stretch** — cap on how far the surface can smear
+- **Tilt angle** + 3D tilt on/off
+- Toggles for jelly deformation, edge snap, and the startup welcome popup
+
+Changes save automatically and apply to the next drag.
+
+## Deep tuning
+
+Internals not in the UI live in `Config` at the top of `src/Program.cs`:
 
 | Constant | Effect |
 |---|---|
-| `HomeStiffnessNear` / `HomeStiffnessFar` | Gap between them = how rubbery; lower `Far` = longer trailing stretch |
-| `StructuralStiffness` | Ripple travel speed / how strongly the sheet keeps its shape |
-| `DampingRatio` | 1.0 = no wobble; ~0.22 = lots of juicy rebounds |
-| `TiltMaxDeg`, `TiltPerVelocity` | How far the sheet leans in 3D |
-| `TiltDampingRatio` | Lower = more 3D wobble after release |
-| `FocalLength` | Smaller = more dramatic perspective |
+| `FocalLength` | Smaller = more dramatic 3D perspective |
+| `TiltPerVelocity`, `TiltDampingRatio` | Tilt responsiveness / post-release 3D wobble |
 | `GridCells` | Mesh resolution (5 → 6×6 points) |
-| `MaxDisplacementFactor` | Cap on how far the jelly can smear |
+| `GlobalDamping`, `MaxSubstep`, `TickMs` | Simulation internals |
 
 ## Troubleshooting — "it's running but nothing wobbles"
 

@@ -53,6 +53,7 @@ static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        Settings.Load();
         Log.Write("=== WobblyWindows v3 starting ===");
         using var tray = new TrayApp();
         tray.ShowWelcome();
@@ -62,7 +63,84 @@ static class Program
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tunables — tweak to taste
+// User settings — persisted to %LOCALAPPDATA%\WobblyWindows\settings.json
+// Sliders map to effective physics values below; Config keeps the internals.
+// ─────────────────────────────────────────────────────────────────────────────
+sealed class Settings
+{
+    public static Settings Current = new();
+
+    // slider-backed (persisted)
+    public int SpeedPercent { get; set; } = 100;      // 40..250 — how fast the jelly reacts/settles
+    public int WobbleAmount { get; set; } = 75;       // 0..100  — rebound count/juiciness
+    public int JellySoftness { get; set; } = 70;      // 0..100  — how rubbery the trailing stretch is
+    public int TiltMaxDeg { get; set; } = 16;         // 0..30   — 3D lean angle
+    public int MaxStretchPercent { get; set; } = 55;  // 20..90  — smear cap
+    public bool DeformEnabled { get; set; } = true;
+    public bool TiltEnabled { get; set; } = true;
+    public bool SnapEnabled { get; set; } = true;
+    public bool ShowWelcomeAtStartup { get; set; } = true;
+
+    // effective physics values (speed scales stiffness quadratically so
+    // response time scales linearly with the slider)
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double Speed2 => Math.Pow(Math.Clamp(SpeedPercent, 40, 250) / 100.0, 2);
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double DampingRatio => 0.60 - 0.50 * Math.Clamp(WobbleAmount, 0, 100) / 100.0;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double HomeStiffnessNear => 430.0 * Speed2;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double HomeStiffnessFar => Math.Max(40.0, 320.0 - 2.6 * Math.Clamp(JellySoftness, 0, 100)) * Speed2;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double StructuralStiffness => Math.Max(150.0, 700.0 - 3.2 * Math.Clamp(JellySoftness, 0, 100)) * Speed2;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double TiltStiffness => 110.0 * Speed2;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double MaxDisplacementFactor => Math.Clamp(MaxStretchPercent, 20, 90) / 100.0;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double RigidStiffness => 700.0 * Speed2;
+
+    static string FilePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "WobblyWindows", "settings.json");
+
+    public static void Load()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+            {
+                var s = System.Text.Json.JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath));
+                if (s != null) Current = s;
+            }
+        }
+        catch (Exception ex) { Log.Write("Settings load failed: " + ex.Message); }
+    }
+
+    public static void Save()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
+            File.WriteAllText(FilePath, System.Text.Json.JsonSerializer.Serialize(Current,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception ex) { Log.Write("Settings save failed: " + ex.Message); }
+    }
+
+    public void ResetToDefaults()
+    {
+        var d = new Settings();
+        SpeedPercent = d.SpeedPercent; WobbleAmount = d.WobbleAmount;
+        JellySoftness = d.JellySoftness; TiltMaxDeg = d.TiltMaxDeg;
+        MaxStretchPercent = d.MaxStretchPercent;
+        DeformEnabled = d.DeformEnabled; TiltEnabled = d.TiltEnabled;
+        SnapEnabled = d.SnapEnabled; ShowWelcomeAtStartup = d.ShowWelcomeAtStartup;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tunables — internals not exposed in the settings UI
 // ─────────────────────────────────────────────────────────────────────────────
 static class Config
 {
@@ -74,28 +152,21 @@ static class Config
     // Spring pulling each mesh point back to its rest spot. Points near the
     // grab are stiffer (follow quickly), far points are looser (trail and
     // stretch). The bigger the gap, the more rubbery it feels.
-    public const double HomeStiffnessNear = 430.0;
-    public const double HomeStiffnessFar = 120.0;
 
     // Springs between neighboring mesh points — how fast ripples travel
     // across the surface and how strongly the sheet keeps its shape.
-    public const double StructuralStiffness = 480.0;
 
     // Damping ratio: 1.0 = no wobble; ~0.22 = lots of juicy rebounds.
-    public const double DampingRatio = 0.22;
 
     // Extra global velocity decay (per second) — kills residual micro-jitter.
     public const double GlobalDamping = 0.8;
 
     // Hard cap on how far any mesh point may stray from its rest spot,
     // as a fraction of the window's larger dimension.
-    public const double MaxDisplacementFactor = 0.55;
 
     // ── 3D tilt ──────────────────────────────────────────────────────────────
-    // The sheet rotates toward its motion and springs back with oscillation.
-    public const double TiltMaxDeg = 16.0;       // max lean angle
-    public const double TiltPerVelocity = 0.020; // degrees per px/s of drag speed
-    public const double TiltStiffness = 110.0;   // tilt spring
+    // The sheet rotates toward its motion and springs back with oscillation.       // max lean angle
+    public const double TiltPerVelocity = 0.020; // degrees per px/s of drag speed   // tilt spring
     public const double TiltDampingRatio = 0.28; // low = 3D wobble on release
     public const double FocalLength = 1500.0;    // perspective strength (smaller = more dramatic)
 
@@ -108,8 +179,6 @@ static class Config
     public const double SettleTiltRad = 0.006;
 
     // ── Fallback rigid mode (used only when capture fails) ──────────────────
-    public const double RigidStiffness = 700.0;
-    public const double RigidDampingRatio = 0.45;
 
     // ── Misc ─────────────────────────────────────────────────────────────────
     public const int SnapThreshold = 6;          // px from monitor edge
@@ -220,14 +289,8 @@ sealed class TrayApp : IDisposable
             if (enabled.Checked) _hook.Reinstall(); // also recovers a dropped hook
         };
 
-        var deform = new ToolStripMenuItem("Jelly deformation") { Checked = _engine.DeformEnabled, CheckOnClick = true };
-        deform.CheckedChanged += (_, _) => _engine.DeformEnabled = deform.Checked;
-
-        var tilt = new ToolStripMenuItem("3D tilt") { Checked = _engine.TiltEnabled, CheckOnClick = true };
-        tilt.CheckedChanged += (_, _) => _engine.TiltEnabled = tilt.Checked;
-
-        var snap = new ToolStripMenuItem("Edge snap on release") { Checked = _engine.SnapEnabled, CheckOnClick = true };
-        snap.CheckedChanged += (_, _) => _engine.SnapEnabled = snap.Checked;
+        var settings = new ToolStripMenuItem("Settings\u2026");
+        settings.Click += (_, _) => SettingsForm.ShowSingleton();
 
         var openLog = new ToolStripMenuItem("Open log file");
         openLog.Click += (_, _) =>
@@ -240,9 +303,7 @@ sealed class TrayApp : IDisposable
         exit.Click += (_, _) => { Dispose(); Application.Exit(); };
 
         menu.Items.Add(enabled);
-        menu.Items.Add(deform);
-        menu.Items.Add(tilt);
-        menu.Items.Add(snap);
+        menu.Items.Add(settings);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(openLog);
         menu.Items.Add(exit);
@@ -260,6 +321,15 @@ sealed class TrayApp : IDisposable
 
     public void ShowWelcome()
     {
+        if (!Settings.Current.ShowWelcomeAtStartup)
+        {
+            _icon.BalloonTipTitle = "WobblyWindows is running";
+            _icon.BalloonTipText = "Drag any title bar to wobble, or Ctrl+Alt+drag anywhere. Right-click the tray icon for Settings.";
+            _icon.BalloonTipIcon = ToolTipIcon.Info;
+            _icon.ShowBalloonTip(4000);
+            return;
+        }
+
         _icon.BalloonTipTitle = "WobblyWindows is running";
         _icon.BalloonTipText = "Drag any title bar to wobble, or hold Ctrl+Alt and drag anywhere on a window.";
         _icon.BalloonTipIcon = ToolTipIcon.Info;
@@ -275,7 +345,8 @@ sealed class TrayApp : IDisposable
             "•  Drag any window by its title bar — it bends, stretches and wobbles.\n" +
             "•  Hold Ctrl+Alt and drag ANYWHERE on ANY window — everything is wobbleable.\n" +
             "•  Maximized windows work too: grab the title bar and pull down.\n\n" +
-            "Right-click the tray icon to toggle effects, open the log, or exit.",
+            "Right-click the tray icon \u2192 Settings to tune speed, jelly softness and 3D tilt,\n" +
+            "open the log, or exit. This popup can be turned off in Settings.",
             "WobblyWindows — installed successfully",
             MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
@@ -517,9 +588,6 @@ sealed class MouseHook : IDisposable
 // ─────────────────────────────────────────────────────────────────────────────
 sealed class WobbleEngine : IDisposable
 {
-    public volatile bool DeformEnabled = true;
-    public volatile bool TiltEnabled = true;
-    public volatile bool SnapEnabled = true;
     public bool Dragging { get { lock (_gate) return _dragging; } }
 
     enum Mode { Idle, Mesh, Rigid }
@@ -556,6 +624,7 @@ sealed class WobbleEngine : IDisposable
     int _pin = -1;
     (int a, int b, double rest)[] _springs = Array.Empty<(int, int, double)>();
     double _maxDisp;
+    double _structK;
 
     // 3D tilt (radians)
     double _tiltX, _tiltY, _tiltVX, _tiltVY;
@@ -624,7 +693,7 @@ sealed class WobbleEngine : IDisposable
             _tx = cursor.X - _grabDx;
             _ty = cursor.Y - _grabDy;
             _releaseCursor = cursor;
-            _pendingSnapCheck = SnapEnabled;
+            _pendingSnapCheck = Settings.Current.SnapEnabled;
         }
     }
 
@@ -747,7 +816,7 @@ sealed class WobbleEngine : IDisposable
 
         ForceForeground(hwnd);
 
-        bool mesh = DeformEnabled
+        bool mesh = Settings.Current.DeformEnabled
                     && TryCapture(hwnd, wrc, vis)
                     && TryMakeTransparent(hwnd);
 
@@ -842,6 +911,7 @@ sealed class WobbleEngine : IDisposable
     // ─────────────────────────────────────────────────────────────────────────
     void InitMesh()
     {
+        var S = Settings.Current;
         double gu, gv, tx, ty;
         lock (_gate) { gu = _grabDx / (double)_visW; gv = _grabDy / (double)_visH; tx = _tx; ty = _ty; }
 
@@ -860,9 +930,9 @@ sealed class WobbleEngine : IDisposable
                 double du = c / (double)(N - 1) - gu;
                 double dv = r / (double)(N - 1) - gv;
                 double t = Math.Clamp(Math.Sqrt(du * du + dv * dv) / Math.Sqrt(2.0), 0, 1);
-                _kHome[i] = Config.HomeStiffnessNear +
-                            (Config.HomeStiffnessFar - Config.HomeStiffnessNear) * t;
-                _cHome[i] = 2.0 * Config.DampingRatio * Math.Sqrt(_kHome[i]);
+                _kHome[i] = S.HomeStiffnessNear +
+                            (S.HomeStiffnessFar - S.HomeStiffnessNear) * t;
+                _cHome[i] = 2.0 * S.DampingRatio * Math.Sqrt(_kHome[i]);
             }
 
         // pin the mesh point nearest the grab — zero lag at the hand
@@ -887,7 +957,8 @@ sealed class WobbleEngine : IDisposable
             }
         _springs = springs.ToArray();
 
-        _maxDisp = Config.MaxDisplacementFactor * Math.Max(_visW, _visH);
+        _maxDisp = S.MaxDisplacementFactor * Math.Max(_visW, _visH);
+        _structK = S.StructuralStiffness;
     }
 
     void TickMesh(double dt)
@@ -974,7 +1045,7 @@ sealed class WobbleEngine : IDisposable
                 double dy = _mpy[b] - _mpy[a];
                 double dist = Math.Sqrt(dx * dx + dy * dy);
                 if (dist < 1e-6) continue;
-                double f = Config.StructuralStiffness * (dist - rest) / dist * h;
+                double f = _structK * (dist - rest) / dist * h;
                 if (a != pin) { _mvx[a] += f * dx; _mvy[a] += f * dy; }
                 if (b != pin) { _mvx[b] -= f * dx; _mvy[b] -= f * dy; }
             }
@@ -1001,15 +1072,16 @@ sealed class WobbleEngine : IDisposable
 
     void IntegrateTilt(double dt, bool dragging)
     {
-        double maxRad = Config.TiltMaxDeg * Math.PI / 180.0;
+        var S = Settings.Current;
+        double maxRad = S.TiltMaxDeg * Math.PI / 180.0;
         double targetY = 0, targetX = 0;
-        if (TiltEnabled && dragging)
+        if (S.TiltEnabled && dragging)
         {
             targetY = Math.Clamp(-_velEmaX * Config.TiltPerVelocity * Math.PI / 180.0, -maxRad, maxRad);
             targetX = Math.Clamp(_velEmaY * Config.TiltPerVelocity * Math.PI / 180.0, -maxRad, maxRad);
         }
 
-        double k = Config.TiltStiffness;
+        double k = S.TiltStiffness;
         double c = 2.0 * Config.TiltDampingRatio * Math.Sqrt(k);
 
         int steps = Math.Max(1, (int)Math.Ceiling(dt / Config.MaxSubstep));
@@ -1211,8 +1283,8 @@ sealed class WobbleEngine : IDisposable
             return;
         }
 
-        double k = Config.RigidStiffness;
-        double c = 2.0 * Config.RigidDampingRatio * Math.Sqrt(k);
+        double k = Settings.Current.RigidStiffness;
+        double c = 2.0 * 0.45 * Math.Sqrt(k);
         int steps = Math.Max(1, (int)Math.Ceiling(dt / Config.MaxSubstep));
         double h = dt / steps;
         for (int s = 0; s < steps; s++)
@@ -1339,6 +1411,185 @@ sealed class WobbleEngine : IDisposable
         _thread.Join(500);
         _canvas?.Dispose();
         _snapshot?.Dispose();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Settings window — dark theme, sliders save instantly
+// ─────────────────────────────────────────────────────────────────────────────
+sealed class SettingsForm : Form
+{
+    static SettingsForm _open;
+    public static void ShowSingleton()
+    {
+        if (_open != null && !_open.IsDisposed)
+        {
+            _open.Activate();
+            _open.BringToFront();
+            return;
+        }
+        _open = new SettingsForm();
+        _open.Show();
+    }
+
+    static readonly Color Bg = Color.FromArgb(10, 10, 26);
+    static readonly Color Accent = Color.FromArgb(0, 229, 255);
+    static readonly Color Dim = Color.FromArgb(120, 130, 170);
+    static readonly Color Txt = Color.FromArgb(222, 230, 255);
+
+    readonly List<Action> _refreshers = new();
+    static Settings S => Settings.Current;
+
+    public SettingsForm()
+    {
+        Text = "WobblyWindows — Settings";
+        BackColor = Bg;
+        ForeColor = Txt;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        Font = new Font("Segoe UI", 9f);
+        ShowInTaskbar = true;
+
+        int y = 14;
+
+        Header("MOTION", ref y);
+        AddSlider("Speed", " %", 40, 250,
+            () => S.SpeedPercent, v => S.SpeedPercent = v, ref y,
+            "How fast the jelly reacts and settles");
+        AddSlider("Wobble amount", "", 0, 100,
+            () => S.WobbleAmount, v => S.WobbleAmount = v, ref y,
+            "How many rebounds after release (0 = none)");
+
+        Header("JELLY", ref y);
+        AddSlider("Softness", "", 0, 100,
+            () => S.JellySoftness, v => S.JellySoftness = v, ref y,
+            "How rubbery the trailing stretch is");
+        AddSlider("Max stretch", " %", 20, 90,
+            () => S.MaxStretchPercent, v => S.MaxStretchPercent = v, ref y,
+            "Cap on how far the surface can smear");
+        AddCheck("Jelly deformation (mesh warp)",
+            () => S.DeformEnabled, v => S.DeformEnabled = v, ref y);
+
+        Header("3D TILT", ref y);
+        AddSlider("Tilt angle", "°", 0, 30,
+            () => S.TiltMaxDeg, v => S.TiltMaxDeg = v, ref y,
+            "How far the window leans into the motion");
+        AddCheck("3D tilt enabled",
+            () => S.TiltEnabled, v => S.TiltEnabled = v, ref y);
+
+        Header("BEHAVIOR", ref y);
+        AddCheck("Edge snap on release (top = maximize, sides = half)",
+            () => S.SnapEnabled, v => S.SnapEnabled = v, ref y);
+        AddCheck("Show welcome popup at startup",
+            () => S.ShowWelcomeAtStartup, v => S.ShowWelcomeAtStartup = v, ref y);
+
+        y += 8;
+        var note = new Label
+        {
+            Text = "Changes save automatically and apply to the next drag.",
+            ForeColor = Dim,
+            AutoSize = false,
+            Location = new Point(16, y),
+            Size = new Size(300, 34),
+        };
+        Controls.Add(note);
+
+        var reset = new Button
+        {
+            Text = "Reset defaults",
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = Accent,
+            BackColor = Color.FromArgb(16, 18, 40),
+            Location = new Point(318, y - 2),
+            Size = new Size(110, 30),
+        };
+        reset.FlatAppearance.BorderColor = Accent;
+        reset.Click += (_, _) =>
+        {
+            S.ResetToDefaults();
+            Settings.Save();
+            foreach (var r in _refreshers) r();
+        };
+        Controls.Add(reset);
+
+        y += 44;
+        ClientSize = new Size(444, y);
+        FormClosed += (_, _) => { if (_open == this) _open = null; };
+    }
+
+    void Header(string text, ref int y)
+    {
+        Controls.Add(new Label
+        {
+            Text = text,
+            ForeColor = Accent,
+            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Location = new Point(16, y),
+            AutoSize = true,
+        });
+        y += 22;
+    }
+
+    void AddSlider(string label, string unit, int min, int max,
+        Func<int> get, Action<int> set, ref int y, string hint)
+    {
+        var name = new Label { Text = label, Location = new Point(24, y), AutoSize = true, ForeColor = Txt };
+        var val = new Label
+        {
+            Text = get() + unit,
+            Location = new Point(360, y),
+            Size = new Size(68, 16),
+            TextAlign = ContentAlignment.MiddleRight,
+            ForeColor = Accent,
+        };
+        var bar = new TrackBar
+        {
+            Minimum = min,
+            Maximum = max,
+            Value = Math.Clamp(get(), min, max),
+            TickStyle = TickStyle.None,
+            Location = new Point(20, y + 18),
+            Size = new Size(408, 30),
+            BackColor = Bg,
+        };
+        var tip = new ToolTip();
+        tip.SetToolTip(bar, hint);
+        bar.ValueChanged += (_, _) =>
+        {
+            set(bar.Value);
+            val.Text = bar.Value + unit;
+            Settings.Save();
+        };
+        _refreshers.Add(() =>
+        {
+            bar.Value = Math.Clamp(get(), min, max);
+            val.Text = bar.Value + unit;
+        });
+        Controls.Add(name);
+        Controls.Add(val);
+        Controls.Add(bar);
+        y += 52;
+    }
+
+    void AddCheck(string label, Func<bool> get, Action<bool> set, ref int y)
+    {
+        var cb = new CheckBox
+        {
+            Text = label,
+            Checked = get(),
+            Location = new Point(24, y),
+            AutoSize = true,
+            ForeColor = Txt,
+        };
+        cb.CheckedChanged += (_, _) =>
+        {
+            set(cb.Checked);
+            Settings.Save();
+        };
+        _refreshers.Add(() => cb.Checked = get());
+        Controls.Add(cb);
+        y += 28;
     }
 }
 
