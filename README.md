@@ -1,6 +1,6 @@
 # WobblyWindows
 
-Compiz-style **wobbly windows** for Windows 11. Drag any real app window — Chrome, Discord, Explorer, VS Code — and it lags behind the cursor, overshoots, jiggles and settles like jelly.
+Compiz-style **wobbly windows** for Windows 11 — with real jelly deformation and a 3D tilt. Drag any app window (Chrome, Discord, Explorer, VS Code…) and its surface bends, stretches, ripples, leans into the motion, then rebounds and settles like soft rubber.
 
 No frameworks, no dependencies, one C# source file + Win32.
 
@@ -8,13 +8,7 @@ No frameworks, no dependencies, one C# source file + Win32.
 
 ## Where does it appear?
 
-**Nothing opens. There is no window.** WobblyWindows is a background app that lives in the **system tray** — the little icon area in the **bottom-right corner of your taskbar, next to the clock**.
-
-1. Run it (see below). A **notification balloon** pops up confirming it started.
-2. Look next to the clock for a **cyan jelly icon**. Windows 11 hides most tray icons by default — click the **`^` (Show hidden icons)** arrow to find it.
-3. Right-click the icon for the menu (Enabled, Squash & stretch, Edge snap, Open log file, Exit).
-
-If you see the icon, it's running. If nothing wobbles, jump to **Troubleshooting** below.
+When you launch it, a **popup confirms it was installed and is running successfully** and explains everything below. There is no main window — WobblyWindows lives in the **system tray**, the icon area in the **bottom-right of the taskbar next to the clock**. Windows 11 hides new tray icons, so click the **`^` (Show hidden icons)** arrow to find it. Right-click the icon for the menu (Enabled, Jelly deformation, 3D tilt, Edge snap, Open log file, Exit).
 
 ## Running it
 
@@ -30,40 +24,24 @@ or build a portable single exe:
 build.bat        →  dist\WobblyWindows.exe   (double-click that)
 ```
 
-## How to wobble (2 ways)
+## Everything is wobbleable
 
-1. **Drag a title bar** — the normal way. Works on native title bars *and* custom drag regions (Chrome's tab strip, Discord's top bar). Grab it, fling it around, let go — it overshoots and jiggles before settling.
-2. **Hold `Ctrl+Alt` and drag anywhere on a window** — the guaranteed fallback. This skips title-bar detection completely, so it works even on apps with weird custom frames.
+- **Title bars & drag regions** — plain drag. Works on native title bars and custom ones (Chrome's tab strip, Discord's top bar).
+- **Any window, from any point** — hold **Ctrl+Alt** and drag anywhere on it. No title bar needed.
+- **Maximized windows** — grab the title bar and pull: the window restores under your cursor (native behavior) and wobbles from there.
 
-Quick test: open **Notepad**, grab its title bar, and drag fast in a circle. That's the baseline — if Notepad wobbles, the engine works and any app that doesn't is a detection issue (use Ctrl+Alt+drag on it).
+Quick test: open Notepad, grab the title bar, fling it in a circle, let go.
 
-## Troubleshooting — "it's running but nothing wobbles"
+## How it works (v3 architecture)
 
-WobblyWindows logs every decision it makes to:
+Windows can't bend another app's live window, and rapidly resizing a real window just looks like glitchy resizing. So WobblyWindows does what Compiz does:
 
-```
-%LOCALAPPDATA%\WobblyWindows\wobbly.log
-```
+1. **On grab**, a snapshot of the window is captured (`PrintWindow` with `PW_RENDERFULLCONTENT`) and the real window is made invisible **in place** (`WS_EX_LAYERED` alpha 0). It never moves during the drag.
+2. The snapshot is drawn onto a deforming **6×6 soft-body mesh** (drawn as clipped triangle pairs per cell — exact affine maps, so no seams even under the 3D perspective) inside a click-through, per-pixel-alpha overlay (`UpdateLayeredWindow`). The grab point is **hard-pinned to the cursor** — zero lag at your hand — while every other mesh point trails on springs (stiff near the grab, loose far away), with structural springs (neighbors + cell diagonals) carrying ripples across the surface.
+3. A **pseudo-3D tilt** is layered on top: the whole sheet rotates toward the motion via a perspective projection, and on release the tilt spring oscillates back — the window visibly wobbles in 3D.
+4. When every mesh point has settled and the tilt has died out, the **real window is moved exactly once** to the final position, its alpha restored, and the overlay hidden. No resize thrash, no fighting the app.
 
-(Or just tray icon → **Open log file**.) Click a title bar once, then check the last lines:
-
-| Log says | Meaning | Fix |
-|---|---|---|
-| `HOOK INSTALL FAILED` | Antivirus / anti-cheat blocked the mouse hook | Whitelist the exe, or close the anti-cheat |
-| *nothing at all when you click* | Hook was silently dropped by Windows | Tray menu → untick then re-tick **Enabled** (this reinstalls the hook) |
-| `hit=1 (not caption)` | The app told us that spot isn't a drag region | Grab the actual title bar, or use **Ctrl+Alt+drag** |
-| `hit-test FAILED (timeout/UIPI — elevated app?)` | Target app runs as admin, we can't talk to it | Run WobblyWindows **as administrator** too |
-| `SetWindowPos FAILED ... error 5` | Same — elevated target window | Run as administrator |
-| `BEGIN drag ...` but no movement | Genuinely weird — send me the log | |
-| `skipped (maximized)` | Maximized windows drag natively by design | Restore the window first |
-
-Also worth knowing: if the exe was downloaded/copied, right-click → Properties → **Unblock** if the checkbox is there, since SmartScreen blocking can prevent it launching at all.
-
-## How it works
-
-1. A `WH_MOUSE_LL` hook watches every left-click. It hit-tests the window under the cursor (`WM_NCHITTEST`, tried on both the child window and its root) — if the answer is `HTCAPTION`, the click is swallowed and the native drag never starts. `Ctrl+Alt` bypasses the hit test.
-2. **Soft-body physics**: the window is simulated as four corner masses joined by structural springs (4 edges + 2 diagonals) — a tiny Compiz-style lattice. The corner nearest your grab gets a stiff "lead" spring toward the cursor, so the grabbed section moves almost immediately; the far corners get a soft "trail" spring, so the rest lags and stretches toward the lead. The structural springs transmit motion between corners at finite speed, so direction changes ripple across the surface. Low damping means the shape overshoots on release and rebounds through a few shrinking oscillations before landing exactly on target, completely still.
-3. Each frame (~250 Hz, semi-implicit Euler with substepping) the real window rect is fitted to the deformed quad — edge positions are the average of their two corners, which captures stretch/compression while cancelling the shear the OS can't display — and applied with `SetWindowPos`. Win32 can't mesh-deform other apps' windows, so this is the closest physical approximation.
+If capture or transparency isn't possible on a particular window (already-layered apps, elevated apps without admin), it automatically falls back to a rigid spring-follow drag, so dragging always works.
 
 ## Tuning
 
@@ -71,20 +49,38 @@ All constants live in `Config` at the top of `src/Program.cs`:
 
 | Constant | Effect |
 |---|---|
-| `LeadStiffness` | How immediately the grabbed section follows the cursor |
-| `TrailStiffness` | How far the rest trails behind (bigger gap from Lead = more rubbery) |
-| `StructuralStiffness` | How fast ripples travel across the surface / shape recovery speed |
-| `DampingRatio` | 1.0 = no wobble, ~0.25 = overshoot + a few shrinking rebounds |
-| `StretchMax` | Max window stretch/compression (fraction of base size) |
-| `SnapThreshold` | Px from screen edge that triggers snap on release |
+| `HomeStiffnessNear` / `HomeStiffnessFar` | Gap between them = how rubbery; lower `Far` = longer trailing stretch |
+| `StructuralStiffness` | Ripple travel speed / how strongly the sheet keeps its shape |
+| `DampingRatio` | 1.0 = no wobble; ~0.22 = lots of juicy rebounds |
+| `TiltMaxDeg`, `TiltPerVelocity` | How far the sheet leans in 3D |
+| `TiltDampingRatio` | Lower = more 3D wobble after release |
+| `FocalLength` | Smaller = more dramatic perspective |
+| `GridCells` | Mesh resolution (5 → 6×6 points) |
+| `MaxDisplacementFactor` | Cap on how far the jelly can smear |
+
+## Troubleshooting — "it's running but nothing wobbles"
+
+Every decision is logged to `%LOCALAPPDATA%\WobblyWindows\wobbly.log` (tray → **Open log file**). Click a title bar once, check the last lines:
+
+| Log says | Meaning | Fix |
+|---|---|---|
+| `HOOK INSTALL FAILED` | Antivirus / anti-cheat blocked the mouse hook | Whitelist the exe |
+| *nothing at all when you click* | Hook silently dropped by Windows | Tray → untick & re-tick **Enabled** (reinstalls hook) |
+| `hit=1 (not caption)` | That spot isn't a drag region | Grab the title bar, or **Ctrl+Alt+drag** |
+| `hit-test FAILED (timeout/UIPI)` | Target app runs as admin | Run WobblyWindows as administrator |
+| `rigid fallback drag …` | Capture/transparency unavailable for that window | Normal — that window still drags with spring physics, just no deformation |
+| `PrintWindow returned false` | App refuses snapshot capture (DRM/protected) | Falls back to rigid automatically |
+| `skipped (maximized/minimized)` shouldn't appear in v3 | — | Maximized windows now restore-and-wobble |
+
+If the exe was downloaded/copied: right-click → Properties → **Unblock** if the checkbox is there.
 
 ## Known limitations
 
-- **Elevated apps** (Task Manager, admin terminals) only wobble if WobblyWindows itself runs as admin.
-- **Maximized windows** drag natively (skipped on purpose).
-- **Esc-to-cancel** mid-drag isn't supported (native move-loop feature).
+- **Elevated apps** (Task Manager, admin terminals) need WobblyWindows run as admin.
+- During a drag the jelly shows a **snapshot** — a playing video inside the window freezes for the duration of the drag (Compiz shows live content; Win32 doesn't offer a warpable live surface).
+- **Esc-to-cancel** mid-drag isn't supported.
 - Windows' snap layouts don't trigger during a wobbly drag; the built-in edge snap (top = maximize, sides = half snap) covers the common cases.
-- Elastic stretch live-resizes the window while it wobbles — heavy apps may stutter; toggle it off in the tray (you keep the lag/overshoot motion, just no size deformation).
+- Very large windows are auto-downscaled for the snapshot to keep rendering fast.
 
 ## Uninstall
 
